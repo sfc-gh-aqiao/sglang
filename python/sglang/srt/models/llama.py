@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -172,6 +173,103 @@ class LlamaAttention(nn.Module):
         return output
 
 
+class LlamaSwiftKVAttention(nn.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_is_neox_style: bool = True,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        # MistralConfig has an optional head_dim introduced by Mistral-Nemo
+        self.head_dim = getattr(
+            config, "head_dim", self.hidden_size // self.total_num_heads
+        )
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.q_proj_swiftkv = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=self.total_num_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj_swiftkv",
+        )
+        self.kv_proj_swiftkv = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=0,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_proj_swiftkv",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=rope_is_neox_style,
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        q, _ = self.q_proj_swiftkv(hidden_states)
+        q, _ = self.rotary_emb(positions, q, torch.empty_like(key))
+        attn_output = self.attn(q, key, value, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
 class LlamaDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -242,6 +340,80 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class LlamaSwiftKVDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None and getattr(
+            config, "original_max_position_embeddings", None
+        ):
+            rope_scaling["original_max_position_embeddings"] = (
+                config.original_max_position_embeddings
+            )
+        rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.self_attn = LlamaSwiftKVAttention(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            rope_is_neox_style=rope_is_neox_style,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
+        self.mlp = LlamaMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            key=key,
+            value=value,
+            forward_batch=forward_batch,
+        )
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+
 class LlamaModel(nn.Module):
     def __init__(
         self,
@@ -256,15 +428,20 @@ class LlamaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        self.num_key_value_layers = config.num_hidden_layers // 2
+        self.num_key_value_groups = 1
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+            ) if idx < self.num_key_value_layers else LlamaSwiftKVDecoderLayer(
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             prefix="model.layers",
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_swiftkv = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -278,7 +455,7 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        for i in range(len(self.layers)):
+        for i in range(self.num_key_value_layers):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -286,8 +463,61 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        # KV projection and cache of all the remaining layers
+        kv_dict = {}
+        swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
+        for layer_idx in range(self.num_key_value_layers, len(self.layers)):
+            self_attn = self.layers[layer_idx].self_attn
+            kv, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
+            k, v = kv.split(self_attn.kv_size, dim=-1)
+            q = torch.empty_like(hidden_states)  # Just temporary buffer
+            _, k = self_attn.rotary_emb(positions, q, k)
+            kv_dict[layer_idx] = (k, v)
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not self_attn.attn.is_cross_attention
+                else forward_batch.encoder_out_cache_loc
+            )
+            k = k.view(-1, self_attn.attn.tp_k_head_num, self_attn.attn.qk_head_dim)
+            v = v.view(-1, self_attn.attn.tp_v_head_num, self_attn.attn.v_head_dim)
+            forward_batch.token_to_kv_pool.set_kv_buffer(self_attn.attn, cache_loc, k, v)
+
+        if forward_batch.forward_mode.is_extend():
+            if not forward_batch.extend_seq_lens.numel():
+                return hidden_states
+            orig_hidden_states = hidden_states
+            last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            positions = positions[last_index]
+            hidden_states = orig_hidden_states[last_index]
+            residual = residual[last_index]
+            kv_dict = {
+                layer_idx: (k[last_index], v[last_index])
+                for layer_idx, (k, v) in kv_dict.items()
+            }
+        else:
+            assert forward_batch.forward_mode.is_decode()
+            orig_hidden_states = hidden_states
+            last_index = None
+
+        for i in range(self.num_key_value_layers, len(self.layers)):
+            layer = self.layers[i]
+            key, value = kv_dict[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                key,
+                value,
+                forward_batch,
+                residual,
+            )
+
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if last_index is None:
+            orig_hidden_states = hidden_states
+        else:
+            orig_hidden_states[last_index] = hidden_states
+        return orig_hidden_states
 
 
 class LlamaForCausalLM(nn.Module):

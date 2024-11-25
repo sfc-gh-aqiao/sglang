@@ -580,7 +580,7 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
-        if self.server_args.disable_cuda_graph:
+        if True: # self.server_args.disable_cuda_graph:
             return
 
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
