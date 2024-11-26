@@ -265,7 +265,7 @@ class LlamaSwiftKVAttention(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.q_proj_swiftkv(hidden_states)
         q, _ = self.rotary_emb(positions, q, torch.empty_like(key))
-        attn_output = self.attn(q, key, value, forward_batch)
+        attn_output = self.attn(q, key, value, forward_batch, set_kv=False)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -495,6 +495,24 @@ class LlamaModel(nn.Module):
                 layer_idx: (k[last_index], v[last_index])
                 for layer_idx, (k, v) in kv_dict.items()
             }
+            wrapper = forward_batch.attn_backend.prefill_wrappers_paged[0]
+            updater = forward_batch.attn_backend.indices_updater_prefill
+            qo_indptr = torch.ones_like(wrapper._qo_indptr_buf).cumsum(dim=0) - 1
+            kv_indptr = wrapper._paged_kv_indptr_buf
+            kv_indices = wrapper._paged_kv_indices_buf
+            paged_kv_last_page_len = wrapper._paged_kv_last_page_len_buf
+            wrapper.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                paged_kv_last_page_len,
+                updater.num_qo_heads,
+                updater.num_kv_heads,
+                updater.head_dim,
+                1,
+            )
+            use_ragged, extend_no_prefix = forward_batch.attn_backend.forward_metadata
+            forward_batch.attn_backend.forward_metadata = (False, extend_no_prefix)
         else:
             assert forward_batch.forward_mode.is_decode()
             orig_hidden_states = hidden_states

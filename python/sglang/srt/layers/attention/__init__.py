@@ -52,12 +52,13 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        set_kv: bool = True,
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(q, k, v, layer, forward_batch)
+            return self.forward_decode(q, k, v, layer, forward_batch, set_kv=set_kv)
         else:
-            return self.forward_extend(q, k, v, layer, forward_batch)
+            return self.forward_extend(q, k, v, layer, forward_batch, set_kv=set_kv)
 
     def forward_decode(
         self,

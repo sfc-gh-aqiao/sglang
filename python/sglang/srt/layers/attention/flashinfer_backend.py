@@ -223,7 +223,7 @@ class FlashInferAttnBackend(AttentionBackend):
         return 0
 
     def forward_extend(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch, set_kv: bool = True,
     ):
         prefill_wrapper_paged = self.prefill_wrappers_paged[
             self._get_wrapper_idx(layer)
@@ -237,7 +237,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         if not use_ragged:
-            if k is not None:
+            if k is not None and set_kv:
                 assert v is not None
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
@@ -272,12 +272,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if set_kv:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch, set_kv: bool = True,
     ):
         decode_wrapper = self.forward_metadata[0][self._get_wrapper_idx(layer)]
         cache_loc = (
@@ -286,7 +287,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        if k is not None:
+        if k is not None and set_kv:
             assert v is not None
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
