@@ -448,6 +448,7 @@ def get_dataset(args, tokenizer):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
+            length_ratio=args.sharegpt_length_ratio,
         )
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -554,6 +555,7 @@ def sample_sharegpt_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    length_ratio: Optional[float] = None,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -594,13 +596,14 @@ def sample_sharegpt_requests(
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or (
-            prompt_len + output_len > 2048 and fixed_output_len is None
-        ):
+        if prompt_len + output_len > 12000:
             # Prune too long sequences.
+            continue
+        if length_ratio is not None and prompt_len / output_len < length_ratio:
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
 
+    print(f"#Requests: {len(filtered_dataset)}")
     print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
     return filtered_dataset
@@ -1338,6 +1341,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
+    )
+    parser.add_argument(
+        "--sharegpt-length-ratio",
+        type=float,
+        default=None,
+        help="Minimum input/output length ratio for each request, all other requests are filtered out.",
     )
     parser.add_argument(
         "--random-input-len",
