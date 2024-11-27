@@ -19,6 +19,7 @@ import importlib.resources
 import inspect
 import json
 import logging
+import os
 import pkgutil
 from functools import lru_cache
 from typing import Optional, Type
@@ -412,20 +413,25 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
+        acrosskv = int(os.getenv("ACROSSKV", "1"))
+        num_kv_layers = (
+            self.model_config.num_hidden_layers // 2 +
+            self.model_config.num_hidden_layers // 2 // acrosskv
+        )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * self.model_config.num_hidden_layers
+                * num_kv_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(self.tp_size)
                 * self.model_config.head_dim
-                * self.model_config.num_hidden_layers
+                * num_kv_layers
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )

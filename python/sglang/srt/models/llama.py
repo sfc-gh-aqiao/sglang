@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -177,6 +178,7 @@ class LlamaSwiftKVAttention(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        num_key_value_layers: int,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -222,15 +224,17 @@ class LlamaSwiftKVAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_proj_swiftkv",
         )
-        self.kv_proj_swiftkv = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=0,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_proj_swiftkv",
-        )
+        acrosskv = int(os.getenv("ACROSSKV", "1"))
+        if (layer_id - num_key_value_layers) % acrosskv == 0:
+            self.kv_proj_swiftkv = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=0,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_proj_swiftkv",
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -344,6 +348,7 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        num_key_value_layers: int,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -362,6 +367,7 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = LlamaSwiftKVAttention(
             config=config,
+            num_key_value_layers=num_key_value_layers,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -429,13 +435,13 @@ class LlamaModel(nn.Module):
             config.hidden_size,
         )
         self.num_key_value_layers = config.num_hidden_layers // 2
-        self.num_key_value_groups = 1
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ) if idx < self.num_key_value_layers else LlamaSwiftKVDecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+                config=config, num_key_value_layers=self.num_key_value_layers,
+                quant_config=quant_config, layer_id=idx, prefix=prefix,
             ),
             prefix="model.layers",
         )
@@ -465,23 +471,27 @@ class LlamaModel(nn.Module):
             )
 
         # KV projection and cache of all the remaining layers
+        acrosskv = int(os.getenv("ACROSSKV", "1"))
         kv_dict = {}
         swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
         for layer_idx in range(self.num_key_value_layers, len(self.layers)):
-            self_attn = self.layers[layer_idx].self_attn
-            kv, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
-            k, v = kv.split(self_attn.kv_size, dim=-1)
-            q = torch.empty_like(hidden_states)  # Just temporary buffer
-            _, k = self_attn.rotary_emb(positions, q, k)
-            kv_dict[layer_idx] = (k, v)
-            cache_loc = (
-                forward_batch.out_cache_loc
-                if not self_attn.attn.is_cross_attention
-                else forward_batch.encoder_out_cache_loc
-            )
-            k = k.view(-1, self_attn.attn.tp_k_head_num, self_attn.attn.qk_head_dim)
-            v = v.view(-1, self_attn.attn.tp_v_head_num, self_attn.attn.v_head_dim)
-            forward_batch.token_to_kv_pool.set_kv_buffer(self_attn.attn, cache_loc, k, v)
+            if (layer_idx - self.num_key_value_layers) % acrosskv == 0:
+                self_attn = self.layers[layer_idx].self_attn
+                kv, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
+                k, v = kv.split(self_attn.kv_size, dim=-1)
+                q = torch.empty_like(hidden_states)  # Just temporary buffer
+                _, k = self_attn.rotary_emb(positions, q, k)
+                kv_dict[layer_idx] = (k, v)
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not self_attn.attn.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                k = k.view(-1, self_attn.attn.tp_k_head_num, self_attn.attn.qk_head_dim)
+                v = v.view(-1, self_attn.attn.tp_v_head_num, self_attn.attn.v_head_dim)
+                forward_batch.token_to_kv_pool.set_kv_buffer(self_attn.attn, cache_loc, k, v)
+            else:
+                kv_dict[layer_idx] = kv_dict[layer_idx - 1]
 
         if forward_batch.forward_mode.is_extend():
             if not forward_batch.extend_seq_lens.numel():

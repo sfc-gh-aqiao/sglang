@@ -22,6 +22,7 @@ BaseTokenToKVPool maps a token location to its KV cache data.
 """
 
 import logging
+import os
 from typing import List, Tuple, Union
 
 import torch
@@ -189,7 +190,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 dtype=self.store_dtype,
                 device=device,
             )
-            for _ in range(layer_num)
+            for _ in range(layer_num // 2)
         ]
         self.v_buffer = [
             torch.empty(
@@ -197,8 +198,28 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 dtype=self.store_dtype,
                 device=device,
             )
-            for _ in range(layer_num)
+            for _ in range(layer_num // 2)
         ]
+        acrosskv = int(os.getenv("ACROSSKV", "1"))
+        for i in range(layer_num // 2):
+            if i % acrosskv == 0:
+                self.k_buffer.append(
+                    torch.empty(
+                        (size + 1, head_num, head_dim),
+                        dtype=self.store_dtype,
+                        device=device,
+                    )
+                )
+                self.v_buffer.append(
+                    torch.empty(
+                        (size + 1, head_num, head_dim),
+                        dtype=self.store_dtype,
+                        device=device,
+                    )
+                )
+            else:
+                self.k_buffer.append(self.k_buffer[-1])
+                self.v_buffer.append(self.v_buffer[-1])
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
