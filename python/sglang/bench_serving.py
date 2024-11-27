@@ -596,7 +596,7 @@ def sample_sharegpt_requests(
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
-        if prompt_len + output_len > 128000:
+        if prompt_len + output_len > 12000:
             # Prune too long sequences.
             continue
         if length_ratio is not None and prompt_len / output_len < length_ratio:
