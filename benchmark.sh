@@ -6,3 +6,5 @@ python -m sglang.bench_serving --backend sglang --dataset-name random --num-prom
 python -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 240 --random-input 32000 --random-output 256 --random-range-ratio 0.9
 python -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 960 --random-input 8000 --random-output 256 --random-range-ratio 0.9
 python -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3840 --random-input 2000 --random-output 256 --random-range-ratio 0.9
+
+python -m sglang.bench_serving --backend sglang --dataset-name sharegpt --num-prompts 5000
